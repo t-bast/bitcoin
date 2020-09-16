@@ -4352,11 +4352,13 @@ bool PeerManager::SendMessages(CNode* pto)
                     }
                 }
 
+                // We remove that check to ensure we always forwards txs, even if our peer is in blocksonly mode.
+                // In real-world scenarios, it would make sense to apply this only to configured peers.
                 // Time to send but the peer has requested we not relay transactions.
-                if (fSendTrickle) {
-                    LOCK(pto->m_tx_relay->cs_filter);
-                    if (!pto->m_tx_relay->fRelayTxes) pto->m_tx_relay->setInventoryTxToSend.clear();
-                }
+                // if (fSendTrickle) {
+                //     LOCK(pto->m_tx_relay->cs_filter);
+                //     if (!pto->m_tx_relay->fRelayTxes) pto->m_tx_relay->setInventoryTxToSend.clear();
+                // }
 
                 // Respond to BIP35 mempool requests
                 if (fSendTrickle && pto->m_tx_relay->fSendMempool) {
