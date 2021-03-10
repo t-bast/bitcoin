@@ -11,6 +11,7 @@ void CCoinControl::SetNull()
     destChange = CNoDestination();
     m_change_type.reset();
     m_add_inputs = true;
+    m_include_unsafe_inputs = false;
     fAllowOtherInputs = false;
     fAllowWatchOnly = false;
     m_avoid_partial_spends = gArgs.GetBoolArg("-avoidpartialspends", DEFAULT_AVOIDPARTIALSPENDS);
