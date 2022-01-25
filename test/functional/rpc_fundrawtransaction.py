@@ -131,6 +131,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         self.test_option_subtract_fee_from_outputs()
         self.test_subtract_fee_with_presets()
         self.test_transaction_too_large()
+        self.test_unconfirmed_ancestors_feerate()
         self.test_include_unsafe()
         self.test_external_inputs()
         self.test_22670()
@@ -1026,6 +1027,48 @@ class RawTransactionsTest(BitcoinTestFramework):
         assert signed_tx['complete']
         self.nodes[2].unloadwallet("extfund")
 
+    def test_unconfirmed_ancestors_feerate(self):
+        self.log.info("Test fundrawtxn correctly sets feerates with unconfirmed ancestors")
+
+        btc_kvb_to_sat_vb = 100000  # (1e5)
+        btc_to_sat = 100000000  # (1e8)
+
+        # Create a wallet with a single (confirmed) utxo.
+        self.nodes[0].createwallet("unconfirmed_ancestors")
+        wallet = self.nodes[0].get_wallet_rpc("unconfirmed_ancestors")
+        self.nodes[2].sendtoaddress(wallet.getnewaddress(), 5)
+        self.sync_mempools()
+        self.generate(self.nodes[0], 1)
+
+        # Spend our only confirmed utxo: we now have an unconfirmed change output.
+        parent_txid = wallet.sendtoaddress(self.nodes[2].getnewaddress(), 1)
+        assert_equal(len(wallet.listunspent()), 0)
+        assert_equal(len(wallet.listunspent(0)), 1)
+
+        # Create a child transaction spending that unconfirmed change output with a higher feerate.
+        child_fee_rate = 2 * btc_kvb_to_sat_vb * self.min_relay_tx_fee
+        child_raw_tx = wallet.createrawtransaction([], [{self.nodes[2].getnewaddress(): 1}])
+        child_funded_tx = wallet.fundrawtransaction(child_raw_tx, {"fee_rate": child_fee_rate})
+        child_signed_tx = wallet.signrawtransactionwithwallet(child_funded_tx['hex'])
+        wallet.sendrawtransaction(child_signed_tx['hex'])
+        child_txid = wallet.decoderawtransaction(child_signed_tx['hex'])['txid']
+        child_mempool_tx = wallet.getmempoolentry(child_txid)
+        assert_equal(child_mempool_tx['ancestorcount'], 2)
+        child_expected_fees = child_mempool_tx['ancestorsize'] * child_fee_rate
+        assert_equal(child_mempool_tx['fees']['ancestor'] * btc_to_sat, child_expected_fees)
+
+        # Create another transaction spending the change output of the previous transaction.
+        descendant_fee_rate = 5 * btc_kvb_to_sat_vb * self.min_relay_tx_fee
+        descendant_raw_tx = wallet.createrawtransaction([], [{self.nodes[2].getnewaddress(): 1}])
+        descendant_funded_tx = wallet.fundrawtransaction(descendant_raw_tx, {"fee_rate": descendant_fee_rate})
+        descendant_signed_tx = wallet.signrawtransactionwithwallet(descendant_funded_tx['hex'])
+        wallet.sendrawtransaction(descendant_signed_tx['hex'])
+        descendant_txid = wallet.decoderawtransaction(descendant_signed_tx['hex'])['txid']
+        descendant_mempool_tx = wallet.getmempoolentry(descendant_txid)
+        assert_equal(descendant_mempool_tx['ancestorcount'], 3)
+        descendant_expected_fees = descendant_mempool_tx['ancestorsize'] * descendant_fee_rate
+        assert_equal(descendant_mempool_tx['fees']['ancestor'] * btc_to_sat, descendant_expected_fees)
+
     def test_include_unsafe(self):
         self.log.info("Test fundrawtxn with unsafe inputs")
 
@@ -1035,22 +1078,39 @@ class RawTransactionsTest(BitcoinTestFramework):
         # We receive unconfirmed funds from external keys (unsafe outputs).
         addr = wallet.getnewaddress()
         inputs = []
+        parents = []
         for i in range(0, 2):
             txid = self.nodes[2].sendtoaddress(addr, 5)
             self.sync_mempools()
             vout = find_vout_for_address(wallet, txid, addr)
             inputs.append((txid, vout))
+            parents.append(self.nodes[0].getmempoolentry(txid))
+
+        btc_kvb_to_sat_vb = 100000  # (1e5)
+        fee_rate = 5 * btc_kvb_to_sat_vb * self.min_relay_tx_fee
 
         # Unsafe inputs are ignored by default.
         rawtx = wallet.createrawtransaction([], [{self.nodes[2].getnewaddress(): 7.5}])
-        assert_raises_rpc_error(-4, "Insufficient funds", wallet.fundrawtransaction, rawtx)
+        assert_raises_rpc_error(-4, "Insufficient funds", wallet.fundrawtransaction, rawtx, {"fee_rate": fee_rate})
 
         # But we can opt-in to use them for funding.
-        fundedtx = wallet.fundrawtransaction(rawtx, {"include_unsafe": True})
+        fundedtx = wallet.fundrawtransaction(rawtx, {"include_unsafe": True, "fee_rate": fee_rate})
         tx_dec = wallet.decoderawtransaction(fundedtx['hex'])
         assert all((txin["txid"], txin["vout"]) in inputs for txin in tx_dec["vin"])
         signedtx = wallet.signrawtransactionwithwallet(fundedtx['hex'])
-        assert wallet.testmempoolaccept([signedtx['hex']])[0]["allowed"]
+        mempool_res = wallet.testmempoolaccept([signedtx['hex']])[0]
+        assert mempool_res["allowed"]
+
+        # The resulting feerate should match what we requested.
+        # Our unconfirmed, unsafe ancestors should be taken into account.
+        btc_to_sat = 100000000  # (1e8)
+        package_fees = mempool_res['fees']['base'] * btc_to_sat
+        package_vsize = mempool_res['vsize']
+        for p in parents:
+            package_fees += p['fees']['base'] * btc_to_sat
+            package_vsize += p['vsize']
+        expected_fees = fee_rate * package_vsize
+        assert_equal(package_fees, expected_fees)
 
         # And we can also use them once they're confirmed.
         self.generate(self.nodes[0], 1)
